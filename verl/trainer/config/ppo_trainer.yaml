@@ -100,6 +100,11 @@ actor_rollout_ref:
     # Huggingface model path. This can be either local path or HDFS path.
     path: ~/models/deepseek-llm-7b-chat
 
+    apply_cmve: True
+    thres_mode: "high"  # Options: "low", "medium", "high", "extra"
+    noise: False
+    mean_mode: "image" # Options: "image", "text"
+
     # Custom chat template for the model.
     custom_chat_template: null
 
@@ -156,6 +161,32 @@ actor_rollout_ref:
     # fsdp, fsdp2 or megatron. fsdp backend used here.
     strategy: fsdp
 
+    use_kl_cmve: True
+
+    # KL penalty type for CMVE: "kl", "abs", "mse", etc.
+    kl_cmve_penalty: "kl"
+
+    # Coefficient for the CMVE KL loss
+    kl_cmve_coef: 0.001
+
+    # Whether to use entropy loss for the CMVE distribution
+    use_cmve_entropy_loss: False
+
+    # Coefficient for the CMVE entropy loss
+    cmve_entropy_loss_coef: 0.01
+
+    # Whether to clip the CMVE KL loss
+    use_kl_cmve_clipping: False
+
+    # Max value for CMVE KL loss clipping
+    kl_cmve_clipping: 0.2
+
+    # Whether to use token-level masking for CMVE KL loss
+    use_kl_cmve_token_level_mask: False
+
+    # Top-p ratio of tokens to apply CMVE KL loss on
+    kl_cmve_token_level_mask_top_p: 0.2
+    
     # Split each sample into sub-batches of this size for PPO
     ppo_mini_batch_size: 256
 

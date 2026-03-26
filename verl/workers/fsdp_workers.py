@@ -113,6 +113,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
+        if config.model.get("apply_cmve", False):
+            self.apply_cmve = True
+            self.thres_mode = config.model.get("thres_mode", "high")
+            self.noise = config.model.get("noise", False)
+            self.mean_mode = config.model.get("mean_mode", "image")
+        else:
+            self.apply_cmve = False
         import torch.distributed
 
         if not torch.distributed.is_initialized():
@@ -323,6 +330,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             apply_monkey_patch(
                 model=actor_module,
+                apply_cmve=self.apply_cmve,
+                thres_mode=self.thres_mode if self.apply_cmve else "high",
+                noise=self.noise if self.apply_cmve else False,
+                mean_mode=self.mean_mode if self.apply_cmve else "image",
                 use_remove_padding=use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
@@ -728,6 +739,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")
 
+        if self.apply_cmve:
+            logger.info("Ensuring CMVE is disabled for actor update.")
+            use_remove_padding = self.config.model.get("use_remove_padding", False)
+            use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+            fused_kernels_backend = self.config.model.get("fused_kernel_options", {}).get("impl_backend", None)
+            apply_monkey_patch(
+                model=self.actor_module,
+                apply_cmve=False,
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
+            )
+            
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
@@ -821,6 +846,72 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="purple")
+    def compute_log_prob_cmve(self, data: DataProto):
+        assert self._is_actor, "compute_log_prob_cmve can only be called on an actor worker."
+
+        if not self.apply_cmve:
+            # If CMVE is not configured for this worker, raise an error or return zero.
+            raise RuntimeError("CMVE is not enabled for this worker. Cannot compute CMVE log probabilities.")
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(get_device_id())
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.rollout.temperature
+
+        # Dynamically enable CMVE for this computation
+        logger.info(f"Temporarily enabling CMVE for log_prob calculation with mode: {self.thres_mode}")
+        use_remove_padding = self.config.model.get("use_remove_padding", False)
+        use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        fused_kernels_backend = self.config.model.get("fused_kernel_options", {}).get("impl_backend", None)
+
+        try:
+            # Enable CMVE
+            apply_monkey_patch(
+                model=self.actor_module,
+                apply_cmve=True,
+                thres_mode=self.thres_mode,
+                noise=self.noise,
+                mean_mode=self.mean_mode,
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
+            )
+
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                output, entropys = self.actor.compute_log_prob(data=data)
+                output = DataProto.from_dict(
+                    tensors={"cmve_log_probs": output, "entropys": entropys},
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
+                output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        finally:
+            # IMPORTANT: Disable CMVE to restore the original model state for other operations like actor update
+            logger.info("Disabling CMVE after log_prob calculation.")
+            apply_monkey_patch(
+                model=self.actor_module,
+                apply_cmve=False, # Set to False to disable
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
+            )
+
+        output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        return output
+    
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):

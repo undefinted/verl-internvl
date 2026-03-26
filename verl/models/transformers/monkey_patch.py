@@ -24,7 +24,7 @@ import torch
 from packaging import version
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
-
+from verl.models.transformers.internvl3_5_cmve import internvl_forward_new
 from verl.utils.import_utils import is_trl_available
 from verl.utils.ulysses import (
     gather_heads_scatter_seq,
@@ -195,8 +195,26 @@ def patch_forward_with_backends(
         raise ValueError(f"Unsupported fused_kernels_backend: {fused_kernels_backend}. Choose 'triton' or 'torch'.")
 
 
+def make_forward_with_default(func, thres_mode="high", noise=False, mean_mode='image'):
+    def wrapper(self, *args, **kwargs):
+        # 如果用户没有传 a，就用默认值
+        if "thres_mode" not in kwargs:
+            kwargs["thres_mode"] = thres_mode
+        if "noise" not in kwargs:
+            kwargs["noise"] = noise
+        if "mean_mode" not in kwargs:
+            kwargs["mean_mode"] = mean_mode
+        return func(self, *args, **kwargs)
+
+    return wrapper
+
+
 def apply_monkey_patch(
     model: PreTrainedModel,
+    apply_cmve: bool,
+    thres_mode="high",
+    noise=False,
+    mean_mode='image',
     ulysses_sp_size: int = 1,
     use_remove_padding: bool = True,
     use_fused_kernels: bool = False,
@@ -313,7 +331,7 @@ def apply_monkey_patch(
 
         return
 
-    elif model.config.model_type in ["internvl_chat", "internvl"]:
+    elif model.config.model_type in ["internvl_chat", "internvl", "internVL3.5"]:
         if ulysses_sp_size > 1:
             if hasattr(module, "Qwen2ForCausalLM"):
                 patch_vlm_for_ulysses_input_slicing(module.Qwen2ForCausalLM, slice_position_ids=True)
@@ -324,6 +342,13 @@ def apply_monkey_patch(
 
         if use_fused_kernels:
             print("Not support fused kernels for InternVL")
+
+        if apply_cmve == True:
+            # 将 internvl_forward_new 包装一下，使其拥有默认参数
+            wrapped_forward = make_forward_with_default(internvl_forward_new, thres_mode, noise, mean_mode)
+            # 将模型的 forward 方法替换为我们包装后的新方法
+            model.forward = wrapped_forward.__get__(model, type(model))
+            print(f"Monkey patch InternVL forward with CMVE. thres_mode={thres_mode}, noise={noise}, mean_mode={mean_mode}")
 
     # transformers<=4.47.1
     if use_remove_padding or ulysses_sp_size > 1:

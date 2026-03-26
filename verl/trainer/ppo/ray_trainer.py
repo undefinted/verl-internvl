@@ -1232,7 +1232,11 @@ class RayPPOTrainer:
                             else:
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
-
+                    if self.config.actor_rollout_ref.model.get("apply_cmve", False):
+                        with marked_timer("cmve_log_prob", metrics):
+                            # This calls the `compute_log_prob_cmve` method you added in fsdp_workers.py
+                            cmve_log_probs = self.actor_rollout_wg.compute_log_prob_cmve(batch)
+                            batch = batch.union(cmve_log_probs)
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):

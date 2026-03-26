@@ -398,6 +398,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if "cmve_log_probs" in data.batch.keys() and self.config.get("use_kl_cmve", False):
+            select_keys.append("cmve_log_probs")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -541,6 +543,53 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    if self.config.get("use_kl_cmve", False) and "cmve_log_probs" in data:
+                        cmve_log_probs = data["cmve_log_probs"]
+                        kl_cmve_weighting = data.get("kl_cmve_weighting", 1.0) # Default to 1 if not provided
+                        kl_cmve_coef = data.get("kl_cmve_coef", self.config.get("kl_cmve_coef"))
+
+                        # compute kl_cmve
+                        cmve_kld = kl_penalty(
+                            logprob=log_prob,
+                            ref_logprob=cmve_log_probs,
+                            kl_penalty=self.config.get("kl_cmve_penalty", "forward"),
+                        )
+
+                        # Apply weighting
+                        kl_cmve_weighting = torch.tensor(
+                            kl_cmve_weighting, device=cmve_kld.device, dtype=cmve_kld.dtype
+                        ).unsqueeze(1)
+                        cmve_kld = cmve_kld * kl_cmve_weighting
+
+                        # Optional: token-level masking
+                        if self.config.get("use_kl_cmve_token_level_mask", False):
+                            top_p = self.config.get("kl_cmve_token_level_mask_top_p", 0.1)
+                            valid_mask = response_mask.bool()
+                            masked_kld = cmve_kld.masked_fill(~valid_mask, float("nan"))
+                            thresh = torch.nanquantile(masked_kld, 1.0 - top_p, dim=1, keepdim=True)
+                            token_mask = cmve_kld >= thresh
+                            cmve_kld = cmve_kld * token_mask.to(cmve_kld.dtype)
+
+                        # Optional: KL clipping
+                        if self.config.get("use_kl_cmve_clipping", False):
+                            clip_val = self.config.get("kl_cmve_clipping")
+                            cmve_kld = torch.clamp(cmve_kld, min=0.0, max=clip_val)
+
+                        # Final KL loss
+                        kl_cmve_loss = agg_loss(cmve_kld, response_mask, loss_agg_mode=loss_agg_mode)
+
+                        # Subtract from policy loss (to maximize KL)
+                        policy_loss = policy_loss - kl_cmve_loss * kl_cmve_coef
+
+                        micro_batch_metrics["actor/kl_cmve_loss"] = -kl_cmve_loss.detach().item()
+                        micro_batch_metrics["actor/kl_cmve_coef"] = kl_cmve_coef
+
+                        # Optional: CMVE-related entropy loss
+                        if self.config.get("use_cmve_entropy_loss", False):
+                            cmve_entropy_loss = -agg_loss(cmve_log_probs, response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = policy_loss + self.config.get("cmve_entropy_loss_coef", 0.0) * cmve_entropy_loss
+                            micro_batch_metrics["actor/cmve_entropy_loss"] = cmve_entropy_loss.detach().item()
+                            
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
